@@ -10,7 +10,8 @@ Uso stdio:
 Uso HTTP:
   HERMES_MCP_TRANSPORT=http HERMES_MCP_PORT=18762 python3 hermes-mcp-math
 """
-import json, sys, os, asyncio, signal as sig_mod
+import ast
+import json, sys, os, re, asyncio, signal as sig_mod
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -54,7 +55,112 @@ except ImportError as e:
 
 TRANSPORT = os.environ.get("HERMES_MCP_TRANSPORT", "stdio")
 
+# CORS origins configurabili via variabile d'ambiente (default: localhost solo)
+_CORS_ORIGINS_RAW = os.environ.get("HERMES_MCP_CORS_ORIGINS", "http://localhost")
+CORS_ORIGINS = [o.strip() for o in _CORS_ORIGINS_RAW.split(",") if o.strip()]
+
 mcp_server = FastMCP(name="hermes-math-mcp", transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UTILITIES DI SICUREZZA
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SYMPY_INJECTION_RE = re.compile(
+    r"__|eval\(|exec\(|compile\(|open\(|getattr\(|setattr\(|delattr\("
+    r"|__import__|globals\(\)|locals\(\)|hasattr\(|vars\(\)"
+    r"|dir\(\)|breakpoint\(|print\(|input\(",
+    re.IGNORECASE,
+)
+
+
+def _validate_sympy_input(value: str) -> str | None:
+    """Valida input per tool SymPy. Restituisce None se OK, stringa errore altrimenti."""
+    if _SYMPY_INJECTION_RE.search(value.strip()):
+        return "Input potenzialmente pericoloso bloccato"
+    return None
+
+
+_NUMPY_WHITELIST = {
+    # Modulo principale e alias
+    "np", "numpy",
+    # Costanti
+    "pi", "e", "euler_gamma", "inf", "nan",
+    # Trigonometriche + inverse
+    "sin", "cos", "tan", "arcsin", "arccos", "arctan",
+    "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh",
+    # Exp/log
+    "exp", "log", "log10", "log2", "log1p", "expm1",
+    # Radici/poteri
+    "sqrt", "cbrt", "square", "power",
+    # Arithmetiche
+    "add", "subtract", "multiply", "divide", "true_divide",
+    "floor_divide", "remainder", "mod", "divmod",
+    # Arrotondamento
+    "absolute", "fabs", "sign", "floor", "ceil", "trunc", "rint", "round",
+    # Min/max
+    "maximum", "minimum", "fmax", "fmin",
+    # Array utility
+    "array", "arange", "linspace", "logspace",
+    "zeros", "ones", "empty", "full", "diag", "eye",
+    # Statistiche
+    "mean", "median", "std", "var", "sum", "prod",
+    "min", "max", "ptp", "percentile",
+    "nanmean", "nanstd", "nanvar", "nansum", "nanprod",
+    # Complessi
+    "real", "imag", "conj", "conjugate", "angle",
+    # Comparazione
+    "greater", "greater_equal", "less", "less_equal",
+    "equal", "not_equal", "logical_and", "logical_or",
+    "logical_not", "logical_xor",
+}
+
+
+def _safe_numpy_eval(expression: str) -> float | list | bool | complex:
+    """Valuta espressione numerica con AST parser + eval su whitelist NumPy."""
+    if _SYMPY_INJECTION_RE.search(expression):
+        raise ValueError("Input potenzialmente pericoloso bloccato")
+
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as e:
+        raise ValueError(f"Espressione non valida (sintassi): {e}")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant):
+            if not isinstance(node.value, (int, float, complex, str, bool, type(None))):
+                raise ValueError(f"Tipo costante non consentito: {type(node.value).__name__}")
+        elif isinstance(node, ast.Name):
+            if node.id not in _NUMPY_WHITELIST:
+                raise ValueError(f"Nome non consentito: {node.id}")
+        elif isinstance(node, ast.BinOp):
+            allowed = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod, ast.FloorDiv)
+            if not isinstance(node.op, allowed):
+                raise ValueError(f"Operatore non consentito: {type(node.op).__name__}")
+        elif isinstance(node, ast.UnaryOp):
+            if not isinstance(node.op, (ast.UAdd, ast.USub)):
+                raise ValueError(f"Operatore unario non consentito: {type(node.op).__name__}")
+        elif isinstance(node, ast.Call):
+            raise ValueError("Chiamate di funzione non consentite")
+        elif isinstance(node, ast.Subscript):
+            raise ValueError("Indicizzazione array non consentita")
+        elif isinstance(node, (ast.List, ast.Tuple)):
+            raise ValueError("Liste/tuple non consentite")
+
+    local_vars = {"np": np, "numpy": np, "pi": np.pi, "e": np.e}
+    result = eval(compile(tree, "<safe_numpy>", "eval"), {"__builtins__": {}}, local_vars)
+
+    if isinstance(result, (np.floating, np.integer)):
+        return float(result)
+    elif isinstance(result, np.ndarray):
+        return result.tolist()
+    elif isinstance(result, (np.bool_, bool)):
+        return bool(result)
+    elif isinstance(result, np.complexfloating):
+        return complex(result)
+    return result
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -74,6 +180,9 @@ async def solve_equation(equation: str, variable: str = "x") -> str:
     """
     if not SYMPY_AVAILABLE:
         return json.dumps({"error": "SymPy non installato"}, indent=2)
+    err = _validate_sympy_input(equation)
+    if err:
+        return json.dumps({"error": err}, indent=2)
     try:
         var = symbols(variable)
         eq = sympify(equation)
@@ -118,6 +227,9 @@ async def differentiate(expression: str, variable: str = "x", order: int = 1) ->
     """
     if not SYMPY_AVAILABLE:
         return json.dumps({"error": "SymPy non installato"}, indent=2)
+    err = _validate_sympy_input(expression)
+    if err:
+        return json.dumps({"error": err}, indent=2)
     try:
         var = symbols(variable)
         expr = sympify(expression)
@@ -144,6 +256,9 @@ async def integrate(expression: str, variable: str = "x", lower_bound: float = N
     """
     if not SYMPY_AVAILABLE:
         return json.dumps({"error": "SymPy non installato"}, indent=2)
+    err = _validate_sympy_input(expression)
+    if err:
+        return json.dumps({"error": err}, indent=2)
     try:
         var = symbols(variable)
         expr = sympify(expression)
@@ -180,6 +295,9 @@ async def limit_func(expression: str, variable: str = "x", point: float = None, 
     """
     if not SYMPY_AVAILABLE:
         return json.dumps({"error": "SymPy non installato"}, indent=2)
+    err = _validate_sympy_input(expression)
+    if err:
+        return json.dumps({"error": err}, indent=2)
     try:
         var = symbols(variable)
         expr = sympify(expression)
@@ -213,6 +331,9 @@ async def simplify_expr(expression: str) -> str:
     """
     if not SYMPY_AVAILABLE:
         return json.dumps({"error": "SymPy non installato"}, indent=2)
+    err = _validate_sympy_input(expression)
+    if err:
+        return json.dumps({"error": err}, indent=2)
     try:
         expr = sympify(expression)
         simp = sympy_simplify(expr)
@@ -237,6 +358,9 @@ async def symbolic_calculate(expression: str, variables: str = None) -> str:
     """
     if not SYMPY_AVAILABLE:
         return json.dumps({"error": "SymPy non installato"}, indent=2)
+    err = _validate_sympy_input(expression)
+    if err:
+        return json.dumps({"error": err}, indent=2)
     try:
         local_vars = {
             "pi": pi, "E": E, "oo": oo, "I": I,
@@ -263,12 +387,12 @@ async def symbolic_calculate(expression: str, variables: str = None) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CALCOLO NUMERICO (NumPy)
+# CALCOLO NUMERICO (NumPy) — AST SAFE EVAL
 # ═══════════════════════════════════════════════════════════════════════════
 
 @mcp_server.tool()
 async def numerical_calculate(expression: str, variables: str = None) -> str:
-    """Calcoli numerici complessi con NumPy.
+    """Calcoli numerici complessi con NumPy (AST-safe evaluation).
 
     Args:
         expression: Espressione con prefisso np. Esempi: "np.sqrt(2) + np.exp(1)"
@@ -277,17 +401,7 @@ async def numerical_calculate(expression: str, variables: str = None) -> str:
     if not NUMPY_AVAILABLE:
         return json.dumps({"error": "NumPy non installato"}, indent=2)
     try:
-        local_vars = {"np": np, "numpy": np, "pi": np.pi, "e": np.e, "__builtins__": {}}
-        if variables:
-            vars_dict = json.loads(variables)
-            local_vars.update(vars_dict)
-        result = eval(expression, {"__builtins__": {}}, local_vars)
-        if isinstance(result, (np.floating, np.integer)):
-            result = float(result)
-        elif isinstance(result, np.ndarray):
-            result = result.tolist()
-        elif isinstance(result, (np.bool_, bool)):
-            result = bool(result)
+        result = _safe_numpy_eval(expression)
         return json.dumps({"expression": expression, "result": result, "dtype": str(type(result).__name__)}, ensure_ascii=False, indent=2)
     except Exception as e:
         return json.dumps({"error": f"Errore nel calcolo numerico: {str(e)}"}, indent=2)
@@ -428,7 +542,7 @@ async def statistics(data: str, operation: str = "full", confidence: float = 0.9
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def main():
-    print(f"🔢 Hermes MCP Math Server v2.0.0", file=sys.stderr)
+    print(f"🔢 Hermes MCP Math Server v2.1.0", file=sys.stderr)
     print(f"   Transport: {TRANSPORT}", file=sys.stderr)
     print(f"   SymPy: {'✓' if SYMPY_AVAILABLE else '✗'}", file=sys.stderr)
     print(f"   NumPy: {'✓' if NUMPY_AVAILABLE else '✗'}", file=sys.stderr)
@@ -442,8 +556,9 @@ async def main():
             print(f"\nRunning in HTTP mode on :{port}...", file=sys.stderr)
             from starlette.middleware.cors import CORSMiddleware
             mcp_app = mcp_server.streamable_http_app()
+            cors_origins_list = CORS_ORIGINS if CORS_ORIGINS else ["http://localhost"]
             cors_app = CORSMiddleware(
-                app=mcp_app, allow_origins=["*"], allow_methods=["POST", "OPTIONS"],
+                app=mcp_app, allow_origins=cors_origins_list, allow_methods=["POST", "OPTIONS"],
                 allow_headers=["*"], expose_headers=["Mcp-Session-Id", "Cache-Control", "Content-Disposition"],
             )
             import uvicorn
