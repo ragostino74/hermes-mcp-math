@@ -59,7 +59,7 @@ TRANSPORT = os.environ.get("HERMES_MCP_TRANSPORT", "stdio")
 _CORS_ORIGINS_RAW = os.environ.get("HERMES_MCP_CORS_ORIGINS", "http://localhost")
 CORS_ORIGINS = [o.strip() for o in _CORS_ORIGINS_RAW.split(",") if o.strip()]
 
-mcp_server = FastMCP(name="hermes-math-mcp", transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
+mcp_server = FastMCP(name="hermes-math-mcp", transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -542,7 +542,7 @@ async def statistics(data: str, operation: str = "full", confidence: float = 0.9
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def main():
-    print(f"🔢 Hermes MCP Math Server v2.1.0", file=sys.stderr)
+    print(f"🔢 Hermes MCP Math Server v2.2.0", file=sys.stderr)
     print(f"   Transport: {TRANSPORT}", file=sys.stderr)
     print(f"   SymPy: {'✓' if SYMPY_AVAILABLE else '✗'}", file=sys.stderr)
     print(f"   NumPy: {'✓' if NUMPY_AVAILABLE else '✗'}", file=sys.stderr)
