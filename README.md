@@ -1,6 +1,6 @@
 # Hermes MCP Math Server
 
-Hermes MCP Server per il calcolo scientifico — v2.1.0
+Hermes MCP Server per il calcolo scientifico — v2.2.0
 
 Strumenti puri di matematica (SymPy, NumPy, SciPy) esposti come MCP tools.
 Nessun web search, nessun REST bridge — solo 9 tool essenziali.
