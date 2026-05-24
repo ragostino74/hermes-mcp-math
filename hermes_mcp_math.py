@@ -5,10 +5,10 @@ Hermes MCP Math Server — Strumenti di calcolo matematico (SymPy, NumPy, SciPy)
 Trasporto: stdio (default) + HTTP/StreamableHTTP (se HERMES_MCP_TRANSPORT=http)
 
 Uso stdio:
-  python3 hermes-mcp-math
+  python3 hermes_mcp_math.py
 
 Uso HTTP:
-  HERMES_MCP_TRANSPORT=http HERMES_MCP_PORT=18762 python3 hermes-mcp-math
+  HERMES_MCP_TRANSPORT=http HERMES_MCP_PORT=18762 python3 hermes_mcp_math.py
 """
 import ast
 import json, sys, os, re, asyncio, signal as sig_mod
@@ -24,11 +24,13 @@ except ImportError:
 
 try:
     from sympy import (
-        symbols, Eq, solve, diff, integrate, limit as sympy_limit,
-        simplify as sympy_simplify, sympify, I, pi, E, oo,
-        sin, cos, tan, exp, log, sqrt, Abs, asin, acos, atan,
-        sinh, cosh, tanh, factorial, binomial,
-        Matrix, factor, expand,
+        symbols, Eq, Matrix, solve as _sympy_solve,
+        diff as _sympy_diff, integrate as _sympy_integrate,
+        limit as sympy_limit, simplify as _sympy_simplify,
+        factor as _sympy_factor, expand as _sympy_expand,
+        sympify, I, pi, E, oo, sin, cos, tan, exp, log, sqrt, Abs,
+        asin, acos, atan, sinh, cosh, tanh,
+        factorial, binomial,
     )
     SYMPY_AVAILABLE = True
 except ImportError as e:
@@ -59,7 +61,11 @@ TRANSPORT = os.environ.get("HERMES_MCP_TRANSPORT", "stdio")
 _CORS_ORIGINS_RAW = os.environ.get("HERMES_MCP_CORS_ORIGINS", "http://localhost")
 CORS_ORIGINS = [o.strip() for o in _CORS_ORIGINS_RAW.split(",") if o.strip()]
 
-mcp_server = FastMCP(name="hermes-math-mcp", transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True))
+mcp_server = FastMCP(
+    name="hermes-math-mcp",
+    host="0.0.0.0",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True),
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -127,7 +133,10 @@ def _safe_numpy_eval(expression: str) -> float | list | bool | complex:
         raise ValueError(f"Espressione non valida (sintassi): {e}")
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant):
+        # Blocca accesso ad attributi privati/__dunder__ per prevenire bypass
+        if isinstance(node, ast.Attribute):
+            raise ValueError("Accesso ad attributi non consentito")
+        elif isinstance(node, ast.Constant):
             if not isinstance(node.value, (int, float, complex, str, bool, type(None))):
                 raise ValueError(f"Tipo costante non consentito: {type(node.value).__name__}")
         elif isinstance(node, ast.Name):
@@ -161,14 +170,12 @@ def _safe_numpy_eval(expression: str) -> float | list | bool | complex:
     return result
 
 
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # CALCOLO SIMBOLICO (SymPy)
 # ═══════════════════════════════════════════════════════════════════════════
 
 @mcp_server.tool()
-async def solve_equation(equation: str, variable: str = "x") -> str:
+async def solve_equation(equation: str, variable: str = "x") -> dict:
     """Risolve equazioni algebriche (lineari, quadratiche, sistemi).
 
     Args:
@@ -179,45 +186,95 @@ async def solve_equation(equation: str, variable: str = "x") -> str:
         variable: Variabile principale (default: "x"). Per sistemi, omessa.
     """
     if not SYMPY_AVAILABLE:
-        return json.dumps({"error": "SymPy non installato"}, indent=2)
+        return {"error": "SymPy non installato"}
     err = _validate_sympy_input(equation)
     if err:
-        return json.dumps({"error": err}, indent=2)
+        return {"error": err}
     try:
         var = symbols(variable)
-        eq = sympify(equation)
-        if isinstance(equation, str) and equation.startswith("[") and "=" in equation:
-            eq_str = equation.strip("[] ").replace(" ", "")
-            eq_list = [sympify(s) for s in eq_str.split(",")]
-            vars_found = sorted(set(eq_str.replace("=", "").replace("+", "").replace("-", "").replace("*", "").replace("/", "").replace("^", "").replace(")", "").replace("(", "").split()))
-            vars_found = [s for s in vars_found if s and s[0].isalpha()]
-            solutions = solve(eq_list, vars_found)
-            return json.dumps({
-                "type": "system", "equations": eq_list, "variables": vars_found,
+        equation_stripped = equation.strip()
+        # Rileva sistemi lineari: [eq1, eq2, ...] o (eq1, eq2, ...)
+        if (equation_stripped.startswith("[") or equation_stripped.startswith("(")) and "=" in equation_stripped:
+            inner = equation_stripped.strip("[]() ")
+            # Usa sympy's solve con le equazioni già parsate
+            eq_list = []
+            for part in _split_eq_string(inner):
+                if "=" in part:
+                    left, right = part.split("=", 1)
+                    eq_list.append(sympify(left.strip()) - sympify(right.strip()))
+                else:
+                    eq_list.append(sympify(part))
+            vars_found = sorted(_extract_symbols_from_eqs(equation_stripped))
+            if not vars_found:
+                vars_found = [variable]
+            solutions = _sympy_solve(eq_list, vars_found)
+            return {
+                "type": "system",
+                "equations": equation_stripped,
+                "variables": vars_found,
                 "solution": {str(k): str(v) for k, v in solutions.items()},
-                "numeric_solution": {str(k): float(v.evalf()) if hasattr(v, 'evalf') else float(v) for k, v in solutions.items()},
-            }, ensure_ascii=False, indent=2)
-        if "=" in equation:
-            left, right = equation.split("=", 1)
+                "numeric_solution": {
+                    str(k): float(v.evalf()) if hasattr(v, 'evalf') else float(v)
+                    for k, v in solutions.items()
+                },
+            }
+        # Equazione singola con "="
+        if "=" in equation_stripped:
+            left, right = equation_stripped.split("=", 1)
             eq = sympify(left.strip()) - sympify(right.strip())
-        solutions = solve(eq, var)
+        else:
+            eq = sympify(equation_stripped)
+        solutions = _sympy_solve(eq, var)
         numeric = []
         for s in solutions:
             try:
                 numeric.append(float(s.evalf()))
             except (TypeError, ValueError):
                 numeric.append(float(s) if isinstance(s, (int, float, complex)) else str(s))
-        return json.dumps({
-            "equation": equation, "variable": variable,
+        return {
+            "equation": equation_stripped,
+            "variable": variable,
             "solutions": [str(s) for s in solutions],
-            "numeric_solutions": numeric, "count": len(solutions),
-        }, ensure_ascii=False, indent=2)
+            "numeric_solutions": numeric,
+            "count": len(solutions),
+        }
     except Exception as e:
-        return json.dumps({"error": f"Errore nella risoluzione: {str(e)}"}, indent=2)
+        return {"error": f"Errore nella risoluzione: {str(e)}"}
+
+
+def _split_eq_string(inner: str) -> list[str]:
+    """Splits a string like 'x + y = 5, x - y = 1' respecting parentheses."""
+    parts = []
+    depth = 0
+    current = ""
+    for ch in inner:
+        if ch in ("(", "["):
+            depth += 1
+            current += ch
+        elif ch in (")", "]"):
+            depth -= 1
+            current += ch
+        elif ch == "," and depth == 0:
+            parts.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        parts.append(current.strip())
+    return parts
+
+
+def _extract_symbols_from_eqs(eq_str: str) -> list[str]:
+    """Extracts variable names from an equation string."""
+    cleaned = eq_str.replace("=", " ").replace("+", " ").replace("-", " ")
+    cleaned = cleaned.replace("*", " ").replace("/", " ").replace("^", " ")
+    cleaned = cleaned.replace("(", " ").replace(")", " ").replace("[", " ").replace("]", " ")
+    tokens = set(cleaned.split())
+    return sorted([s for s in tokens if s and s[0].isalpha() and not s.isdigit()])
 
 
 @mcp_server.tool()
-async def differentiate(expression: str, variable: str = "x", order: int = 1) -> str:
+async def differentiate(expression: str, variable: str = "x", order: int = 1) -> dict:
     """Calcola la derivata di un'espressione simbolica.
 
     Args:
@@ -226,26 +283,29 @@ async def differentiate(expression: str, variable: str = "x", order: int = 1) ->
         order: Ordine della derivata (default: 1, max: 10)
     """
     if not SYMPY_AVAILABLE:
-        return json.dumps({"error": "SymPy non installato"}, indent=2)
+        return {"error": "SymPy non installato"}
     err = _validate_sympy_input(expression)
     if err:
-        return json.dumps({"error": err}, indent=2)
+        return {"error": err}
     try:
         var = symbols(variable)
         expr = sympify(expression)
-        result = diff(expr, var, order)
-        simp = sympy_simplify(result)
-        return json.dumps({
-            "expression": expression, "variable": variable, "order": order,
-            "derivative": str(result), "simplified": str(simp),
+        result = _sympy_diff(expr, var, order)
+        simp = _sympy_simplify(result)
+        return {
+            "expression": expression,
+            "variable": variable,
+            "order": order,
+            "derivative": str(result),
+            "simplified": str(simp),
             "result_latex": result.latex() if hasattr(result, 'latex') else str(result),
-        }, ensure_ascii=False, indent=2)
+        }
     except Exception as e:
-        return json.dumps({"error": f"Errore nella derivazione: {str(e)}"}, indent=2)
+        return {"error": f"Errore nella derivazione: {str(e)}"}
 
 
 @mcp_server.tool()
-async def integrate(expression: str, variable: str = "x", lower_bound: float = None, upper_bound: float = None) -> str:
+async def integrate(expression: str, variable: str = "x", lower_bound: float | None = None, upper_bound: float | None = None) -> dict:
     """Calcola integrali indefiniti o definiti.
 
     Args:
@@ -255,36 +315,44 @@ async def integrate(expression: str, variable: str = "x", lower_bound: float = N
         upper_bound: Limite superiore (opzionale)
     """
     if not SYMPY_AVAILABLE:
-        return json.dumps({"error": "SymPy non installato"}, indent=2)
+        return {"error": "SymPy non installato"}
     err = _validate_sympy_input(expression)
     if err:
-        return json.dumps({"error": err}, indent=2)
+        return {"error": err}
     try:
         var = symbols(variable)
         expr = sympify(expression)
         if lower_bound is not None and upper_bound is not None:
-            result = integrate(expr, (var, lower_bound, upper_bound))
+            lb = sympify(str(lower_bound))
+            ub = sympify(str(upper_bound))
+            result = _sympy_integrate(expr, (var, lb, ub))
             numeric = float(result.evalf()) if hasattr(result, 'evalf') else float(result)
-            return json.dumps({
-                "expression": expression, "variable": variable, "type": "definite",
-                "bounds": [lower_bound, upper_bound], "result": str(result),
+            return {
+                "expression": expression,
+                "variable": variable,
+                "type": "definite",
+                "bounds": [lower_bound, upper_bound],
+                "result": str(result),
                 "result_latex": result.latex() if hasattr(result, 'latex') else str(result),
                 "numeric": numeric,
-            }, ensure_ascii=False, indent=2)
+            }
         else:
-            result = integrate(expr, var)
-            simp = sympy_simplify(result)
-            return json.dumps({
-                "expression": expression, "variable": variable, "type": "indefinite",
-                "result": str(result), "simplified": str(simp),
+            result = _sympy_integrate(expr, var)
+            simp = _sympy_simplify(result)
+            return {
+                "expression": expression,
+                "variable": variable,
+                "type": "indefinite",
+                "result": str(result),
+                "simplified": str(simp),
                 "result_latex": result.latex() if hasattr(result, 'latex') else str(result),
-            }, ensure_ascii=False, indent=2)
+            }
     except Exception as e:
-        return json.dumps({"error": f"Errore nell'integrazione: {str(e)}"}, indent=2)
+        return {"error": f"Errore nell'integrazione: {str(e)}"}
 
 
 @mcp_server.tool()
-async def limit_func(expression: str, variable: str = "x", point: float = None, direction: str = "both") -> str:
+async def limit_func(expression: str, variable: str = "x", point: float | None = None, direction: str = "both") -> dict:
     """Calcola il limite di una funzione.
 
     Args:
@@ -294,14 +362,14 @@ async def limit_func(expression: str, variable: str = "x", point: float = None, 
         direction: "left", "right" o "both" (default: "both")
     """
     if not SYMPY_AVAILABLE:
-        return json.dumps({"error": "SymPy non installato"}, indent=2)
+        return {"error": "SymPy non installato"}
     err = _validate_sympy_input(expression)
     if err:
-        return json.dumps({"error": err}, indent=2)
+        return {"error": err}
     try:
         var = symbols(variable)
         expr = sympify(expression)
-        point_val = sympify(point) if point is not None else 0
+        point_val = sympify(str(point)) if point is not None else 0
         if direction == "left":
             result = sympy_limit(expr, var, point_val, dir="-")
         elif direction == "right":
@@ -312,44 +380,49 @@ async def limit_func(expression: str, variable: str = "x", point: float = None, 
             numeric = float(result.evalf()) if hasattr(result, 'evalf') else float(result)
         except (TypeError, ValueError):
             numeric = str(result)
-        return json.dumps({
-            "expression": expression, "variable": variable,
-            "point": str(point), "direction": direction,
-            "limit": str(result), "limit_latex": result.latex() if hasattr(result, 'latex') else str(result),
+        return {
+            "expression": expression,
+            "variable": variable,
+            "point": str(point),
+            "direction": direction,
+            "limit": str(result),
+            "limit_latex": result.latex() if hasattr(result, 'latex') else str(result),
             "numeric": numeric,
-        }, ensure_ascii=False, indent=2)
+        }
     except Exception as e:
-        return json.dumps({"error": f"Errore nel calcolo del limite: {str(e)}"}, indent=2)
+        return {"error": f"Errore nel calcolo del limite: {str(e)}"}
 
 
 @mcp_server.tool()
-async def simplify_expr(expression: str) -> str:
+async def simplify_expr(expression: str) -> dict:
     """Semplifica un'espressione simbolica.
 
     Args:
         expression: Espressione. Esempi: "x**2 + 2*x + x**2", "sin(x)**2 + cos(x)**2", "(x**2 - 1)/(x - 1)"
     """
     if not SYMPY_AVAILABLE:
-        return json.dumps({"error": "SymPy non installato"}, indent=2)
+        return {"error": "SymPy non installato"}
     err = _validate_sympy_input(expression)
     if err:
-        return json.dumps({"error": err}, indent=2)
+        return {"error": err}
     try:
         expr = sympify(expression)
-        simp = sympy_simplify(expr)
-        factored = str(factor(expr))
-        expanded = str(expand(expr))
-        return json.dumps({
-            "expression": expression, "simplified": str(simp),
+        simp = _sympy_simplify(expr)
+        factored = str(_sympy_factor(expr))
+        expanded = str(_sympy_expand(expr))
+        return {
+            "expression": expression,
+            "simplified": str(simp),
             "simplified_latex": simp.latex() if hasattr(simp, 'latex') else str(simp),
-            "factored": factored, "expanded": expanded,
-        }, ensure_ascii=False, indent=2)
+            "factored": factored,
+            "expanded": expanded,
+        }
     except Exception as e:
-        return json.dumps({"error": f"Errore nella semplificazione: {str(e)}"}, indent=2)
+        return {"error": f"Errore nella semplificazione: {str(e)}"}
 
 
 @mcp_server.tool()
-async def symbolic_calculate(expression: str, variables: str = None) -> str:
+async def symbolic_calculate(expression: str, variables: str | None = None) -> dict:
     """Calcoli simbolici e numerici con valutazione.
 
     Args:
@@ -357,10 +430,10 @@ async def symbolic_calculate(expression: str, variables: str = None) -> str:
         variables: Variabili in formato JSON (opzionale). Esempio: '{"a": 5, "b": 3}'
     """
     if not SYMPY_AVAILABLE:
-        return json.dumps({"error": "SymPy non installato"}, indent=2)
+        return {"error": "SymPy non installato"}
     err = _validate_sympy_input(expression)
     if err:
-        return json.dumps({"error": err}, indent=2)
+        return {"error": err}
     try:
         local_vars = {
             "pi": pi, "E": E, "oo": oo, "I": I,
@@ -376,14 +449,14 @@ async def symbolic_calculate(expression: str, variables: str = None) -> str:
             local_vars.update(vars_dict)
         result = sympify(expression, locals=local_vars)
         numeric = float(result.evalf()) if hasattr(result, 'evalf') else float(result)
-        return json.dumps({
+        return {
             "expression": expression,
             "symbolic_result": str(result),
             "symbolic_latex": result.latex() if hasattr(result, 'latex') else str(result),
             "numeric": numeric,
-        }, ensure_ascii=False, indent=2)
+        }
     except Exception as e:
-        return json.dumps({"error": f"Errore nel calcolo: {str(e)}"}, indent=2)
+        return {"error": f"Errore nel calcolo: {str(e)}"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -391,7 +464,7 @@ async def symbolic_calculate(expression: str, variables: str = None) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 @mcp_server.tool()
-async def numerical_calculate(expression: str, variables: str = None) -> str:
+async def numerical_calculate(expression: str, variables: str | None = None) -> dict:
     """Calcoli numerici complessi con NumPy (AST-safe evaluation).
 
     Args:
@@ -399,12 +472,12 @@ async def numerical_calculate(expression: str, variables: str = None) -> str:
         variables: Variabili in formato JSON (opzionale).
     """
     if not NUMPY_AVAILABLE:
-        return json.dumps({"error": "NumPy non installato"}, indent=2)
+        return {"error": "NumPy non installato"}
     try:
         result = _safe_numpy_eval(expression)
-        return json.dumps({"expression": expression, "result": result, "dtype": str(type(result).__name__)}, ensure_ascii=False, indent=2)
+        return {"expression": expression, "result": result, "dtype": str(type(result).__name__)}
     except Exception as e:
-        return json.dumps({"error": f"Errore nel calcolo numerico: {str(e)}"}, indent=2)
+        return {"error": f"Errore nel calcolo numerico: {str(e)}"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -412,7 +485,7 @@ async def numerical_calculate(expression: str, variables: str = None) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 @mcp_server.tool()
-async def matrix_operations(matrix_str: str, operation: str = "det") -> str:
+async def matrix_operations(matrix_str: str, operation: str = "det") -> dict:
     """Operazioni matriciali con NumPy/SciPy.
 
     Args:
@@ -421,7 +494,7 @@ async def matrix_operations(matrix_str: str, operation: str = "det") -> str:
                    "transpose", "rank", "trace", "norm", "condition"
     """
     if not NUMPY_AVAILABLE or not SCIPY_AVAILABLE:
-        return json.dumps({"error": "NumPy/SciPy non installati"}, indent=2)
+        return {"error": "NumPy/SciPy non installati"}
     try:
         matrix = np.array(json.loads(matrix_str), dtype=float)
         rows, cols = matrix.shape
@@ -456,11 +529,11 @@ async def matrix_operations(matrix_str: str, operation: str = "det") -> str:
         elif operation == "condition":
             result["condition_number"] = _clean(np.linalg.cond(matrix))
         else:
-            return json.dumps({"error": f"Operazione non valida: {operation}",
-                "supported": ["det", "eigenvalues", "eigenvectors", "inverse", "svd", "transpose", "rank", "trace", "norm", "condition"]}, indent=2)
-        return json.dumps(result, ensure_ascii=False, indent=2)
+            return {"error": f"Operazione non valida: {operation}",
+                "supported": ["det", "eigenvalues", "eigenvectors", "inverse", "svd", "transpose", "rank", "trace", "norm", "condition"]}
+        return result
     except Exception as e:
-        return json.dumps({"error": f"Errore matriciale: {str(e)}"}, indent=2)
+        return {"error": f"Errore matriciale: {str(e)}"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -468,7 +541,7 @@ async def matrix_operations(matrix_str: str, operation: str = "det") -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 @mcp_server.tool()
-async def statistics(data: str, operation: str = "full", confidence: float = 0.95) -> str:
+async def statistics(data: str, operation: str = "full", confidence: float = 0.95) -> dict:
     """Analisi statistica descrittiva con NumPy/SciPy.
 
     Args:
@@ -477,7 +550,7 @@ async def statistics(data: str, operation: str = "full", confidence: float = 0.9
         confidence: Livello di confidenza (default: 0.95)
     """
     if not NUMPY_AVAILABLE or not SCIPY_AVAILABLE:
-        return json.dumps({"error": "NumPy/SciPy non installati"}, indent=2)
+        return {"error": "NumPy/SciPy non installati"}
     try:
         data_list = json.loads(data)
         if isinstance(data_list[0], list):
@@ -527,14 +600,14 @@ async def statistics(data: str, operation: str = "full", confidence: float = 0.9
                 x_data = np.arange(len(arr), dtype=float)
                 y_data = arr
             else:
-                return json.dumps({"error": "Regressione richiede almeno 2 dati"}, indent=2)
+                return {"error": "Regressione richiede almeno 2 dati"}
             slope, intercept, r_value, p_value, std_err = scipy_stats.linregress(x_data, y_data)
             result["regression"] = {"slope": float(slope), "intercept": float(intercept), "r_value": float(r_value),
                 "r_squared": float(r_value ** 2), "p_value": float(p_value), "std_err": float(std_err),
                 "equation": f"y = {slope:.6f}x + {intercept:.6f}"}
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        return result
     except Exception as e:
-        return json.dumps({"error": f"Errore statistico: {str(e)}"}, indent=2)
+        return {"error": f"Errore statistico: {str(e)}"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
